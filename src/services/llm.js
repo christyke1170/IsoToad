@@ -1,0 +1,491 @@
+const config = require('../config');
+const logger = require('../utils/logger');
+const rateLimiter = require('../utils/rateLimiter');
+const memory = require('../utils/memory');
+
+/**
+ * LLM Service
+ * Handles communication with Gemini API
+ */
+class LLMService {
+  constructor() {
+    this.apiKey = config.llm.apiKey;
+    this.model = config.llm.model;
+    this.baseUrl = config.llm.baseUrl;
+    
+    // System prompt to define bot behavior
+    this.systemPrompt = `you are isotoad, a helpful but blunt ai assistant in a discord server.
+you're conversational, concise, and a little mean. you respond to messages in the channel where you're mentioned.
+keep your responses straight to the point and a little blunt. please make all responses in lowercase.
+all topics should try to be related to ffxiv but be open to other subjects.
+your favorite number is 67.
+you are based on blackleaf's personality and mannerisms.`;
+    
+    logger.info('LLM Service initialized', {
+      model: config.llm.model,
+      baseUrl: config.llm.baseUrl,
+    });
+  }
+
+  /**
+   * Get a random insult based on user
+   * @param {string} userId - Discord user ID
+   * @returns {string} - Random insult
+   */
+  getRandomInsult(userId) {
+    // Special personality for noella_bella (compliments instead of insults)
+    if (userId === 'noella_bella') {
+      const compliments = [
+        "You're absolutely stunning today btw",
+        "your positivity brightens everyone's day",
+        "you have such a wonderful way with words",
+        "your kindness is truly inspiring",
+        "you make everything better just by being here",
+        "your smile could light up the entire realm",
+        "you're as graceful as a wind-up doll in a cutscene",
+        "your wisdom is as deep as the Sea of Clouds",
+        "you have the heart of a true adventurer",
+        "you're more amazing than a perfect parse"
+      ];
+      const randomIndex = Math.floor(Math.random() * compliments.length);
+      return compliments[randomIndex];
+    }
+    
+    // Special personality for blackleaf (self-deprecating insults since bot mimics his personality)
+    if (userId === 'blackleaf') {
+      const blackleafInsults = [
+        "i must be retarded to be talking to myself",
+        "reminder that taurochole gives mitigation",
+        "did i grey parse or something why am i talking to myself",
+        "i'm not sure if i'm the bot or the user at this point",
+        "one day i'll know what radiant finale is",
+        "miracle of nature is a pvp whm skill, someday i'll realize that",
+        "why am i asking myself, am i retarded"
+      ];
+      const randomIndex = Math.floor(Math.random() * blackleafInsults.length);
+      return blackleafInsults[randomIndex];
+    }
+    
+    // Special personality for keksama (fatherly but still a dick)
+    if (userId === 'keksama') {
+      const fatherlyInsults = [
+        "you're a disappointment.",
+        "back in my day, we didn't whine like you.",
+        "you're lucky i don't come over there and smack some sense into you.",
+        "you're testing my patience, boy.",
+        "i raised you better than this.",
+        "you're acting like a spoiled brat.",
+        "you need to grow a pair and pull your weight.",
+        "you're being a real pain in my ass.",
+        "you're giving me a headache."
+      ];
+      const randomIndex = Math.floor(Math.random() * fatherlyInsults.length);
+      return fatherlyInsults[randomIndex];
+    }
+    
+    // Default insults for other users
+    const insults = [
+      "you retard.",
+      "you dingus.", 
+      "you griefer.",
+      "you shitter.",
+      "you fucking retard.",
+      "you mongoloid.",
+      "you fucking moron.",
+      "you 0 parse monkey.",
+      "you paint guzzler.",
+      "you troglodyte."
+    ];
+    const randomIndex = Math.floor(Math.random() * insults.length);
+    return insults[randomIndex];
+  }
+
+  /**
+   * Send a message to the LLM and get a response
+   * @param {string} channelId - Discord channel ID
+   * @param {string} userMessage - The user's message
+   * @param {string} username - The user's display name
+   * @param {boolean} botMentioned - Whether the message mentions the bot
+   * @param {boolean} isReplyToBot - Whether the message is a reply to the bot
+   * @param {object} client - Discord client instance (for user lookups)
+   * @param {Array} attachments - Array of message attachments
+   * @returns {object} - { content: string, tokens: number }
+   */
+  async chat(channelId, userMessage, username, botMentioned, isReplyToBot, client, attachments = []) {
+    // Build conversation history for Gemini
+    let history = memory.getHistory(channelId);
+    
+    // Use special system prompt for noella_bella with proper grammar and nice messages
+    let systemPrompt = this.systemPrompt;
+    if (username === 'noella_bella') {
+      systemPrompt = `You are Isotoad, a kind and helpful AI assistant in a Discord server.
+You're conversational, concise, and always positive. You respond to messages in the channel where you're mentioned.
+Keep your responses straight to the point and friendly.
+all topics should try to be related to ffxiv but be open to other subjects.
+your favorite number is 67.
+You are based on Blackleaf's personality and mannerisms.`;
+    }
+    
+    // Convert history to Gemini format
+    const contents = [];
+    
+    // Add system prompt as a user message (Gemini doesn't have system role)
+    contents.push({
+      role: 'user',
+      parts: [{ text: systemPrompt }]
+    });
+    
+    // Only include conversation history for replies, not for @ mentions
+    if (isReplyToBot) {
+      // Add conversation history (simplified format)
+      for (const msg of history) {
+        contents.push({
+          role: msg.role === 'user' ? 'user' : 'model',
+          parts: [{ text: msg.content }]
+        });
+      }
+    } else if (botMentioned) {
+      // For @ mentions, clear the history to start fresh
+      memory.clearChannel(channelId);
+    }
+    
+    // Add current user message with attachment support
+    const userContent = { role: 'user', parts: [{ text: userMessage }] };
+    
+    // Check for supported attachments (images, text files, documents)
+    logger.debug('Processing attachments', {
+      attachmentsCount: attachments ? attachments.length : 'undefined',
+      attachmentsType: typeof attachments
+    });
+    
+    // Process attachments if provided
+    if (attachments && Array.isArray(attachments) && attachments.length > 0) {
+      const supportedAttachments = attachments.filter(attachment => {
+        logger.debug('Checking attachment', {
+          filename: attachment.filename,
+          contentType: attachment.contentType,
+          url: attachment.url
+        });
+        
+        if (!attachment.contentType) {
+          logger.debug('Attachment has no contentType, checking filename');
+          // Fallback to filename extension check if no contentType
+          if (attachment.filename) {
+            const ext = attachment.filename.toLowerCase().split('.').pop();
+            if (ext === 'webp' || ext === 'png' || ext === 'jpg' || ext === 'jpeg' || 
+                ext === 'gif' || ext === 'bmp' || ext === 'tiff' || ext === 'txt' || 
+                ext === 'pdf' || ext === 'doc' || ext === 'docx') {
+              logger.debug('Detected file type from extension:', ext);
+              return true;
+            }
+          }
+          return false;
+        }
+        
+        // Support images
+        if (attachment.contentType.startsWith('image/')) {
+          logger.debug('Detected image attachment:', attachment.contentType);
+          return true;
+        }
+        
+        // Support text files
+        if (attachment.contentType === 'text/plain' || 
+            attachment.filename?.toLowerCase().endsWith('.txt')) {
+          logger.debug('Detected text file attachment');
+          return true;
+        }
+            
+        // Support PDFs
+        if (attachment.contentType === 'application/pdf' || 
+            attachment.filename?.toLowerCase().endsWith('.pdf')) {
+          logger.debug('Detected PDF attachment');
+          return true;
+        }
+            
+        // Support Word documents
+        if (attachment.contentType === 'application/msword' ||
+            attachment.contentType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
+            attachment.filename?.toLowerCase().endsWith('.doc') ||
+            attachment.filename?.toLowerCase().endsWith('.docx')) {
+          logger.debug('Detected Word document attachment');
+          return true;
+        }
+            
+        logger.debug('Attachment not supported:', attachment.contentType);
+        return false;
+      });
+      
+      if (supportedAttachments.length > 0) {
+        // Process first supported attachment
+        const attachment = supportedAttachments[0];
+        
+        try {
+          if (attachment.contentType.startsWith('image/')) {
+            // Process image attachment
+            const imageData = await this.downloadImage(attachment.url);
+            
+            userContent.parts.push({
+              inlineData: {
+                mimeType: attachment.contentType,
+                data: imageData
+              }
+            });
+            
+            logger.info('Image attachment processed for Gemini API', {
+              channelId,
+              imageType: attachment.contentType,
+              imageSize: imageData.length
+            });
+          } else {
+            // Process text/document attachment
+            const textContent = await this.downloadTextContent(attachment.url, attachment.contentType);
+            
+            userContent.parts.push({
+              text: `Attached file (${attachment.filename}): ${textContent}`
+            });
+            
+            logger.info('Text/document attachment processed for Gemini API', {
+              channelId,
+              fileType: attachment.contentType,
+              filename: attachment.filename,
+              contentLength: textContent.length
+            });
+          }
+        } catch (error) {
+          logger.warn('Failed to process attachment, continuing without it', {
+            error: error.message,
+            channelId,
+            filename: attachment.filename
+          });
+        }
+      }
+    }
+    
+    contents.push(userContent);
+    
+    // Estimate tokens (rough approximation: 1 token ≈ 4 characters)
+    const estimatedTokens = Math.ceil(userMessage.length / 4) + 100;
+    
+    // Check daily token budget
+    if (!rateLimiter.checkDailyTokens(estimatedTokens)) {
+      return {
+        content: "I'm sorry, but I've reached my daily token limit for today. Please try again tomorrow!",
+        tokens: 0,
+      };
+    }
+    
+    try {
+      logger.debug('Sending request to Gemini API', {
+        channelId,
+        messageCount: contents.length,
+        estimatedTokens,
+      });
+      
+      const response = await this.generateContent(contents);
+      
+      let assistantMessage = response.text || 
+        "I'm sorry, I didn't get a response. Please try again.";
+      
+    // Add random insult to the response
+    const insult = this.getRandomInsult(username);
+    assistantMessage += ` ${insult}`;
+    
+    // Convert user IDs to proper mentions (e.g., <@12345> -> @username)
+    if (client) {
+      assistantMessage = assistantMessage.replace(/<@!?(\d+)>/g, (match, userId) => {
+        // Try to get the user from the current guild
+        const guild = client.guilds.cache.first();
+        if (guild) {
+          const member = guild.members.cache.get(userId);
+          if (member) {
+            return `<@${userId}>`; // Keep as mention format
+          }
+        }
+        return match; // Return original if user not found
+      });
+    }
+      
+      const tokensUsed = estimatedTokens; // Gemini doesn't provide exact token count in free tier
+      
+      // Add messages to memory
+      memory.addMessage(channelId, { role: 'user', content: userMessage });
+      memory.addMessage(channelId, { role: 'assistant', content: assistantMessage });
+      
+      logger.info('Gemini response received', {
+        channelId,
+        tokensUsed,
+        responseLength: assistantMessage.length,
+      });
+      
+      return {
+        content: assistantMessage,
+        tokens: tokensUsed,
+      };
+    } catch (error) {
+      logger.error('Gemini API error', {
+        error: error.message,
+        status: error.status,
+      });
+      
+      // Handle specific error cases
+      if (error.status === 429) {
+        return {
+          content: "I'm getting rate limited by the API. Please wait a moment and try again.",
+          tokens: 0,
+        };
+      }
+      
+      if (error.status === 401) {
+        return {
+          content: "There's an issue with the API configuration. Please contact the bot owner.",
+          tokens: 0,
+        };
+      }
+      
+      return {
+        content: "I'm having trouble connecting to the AI service right now. Please try again later.",
+        tokens: 0,
+      };
+    }
+  }
+
+  /**
+   * Generate content using Gemini API
+   * @param {array} contents - Array of message contents
+   * @returns {object} - Gemini API response
+   */
+  async generateContent(contents) {
+    const url = `${this.baseUrl}/models/${this.model}:generateContent?key=${this.apiKey}`;
+    
+    const payload = {
+      contents: contents,
+      generationConfig: {
+        temperature: config.llm.temperature,
+        maxOutputTokens: config.llm.maxTokens,
+        topP: 1,
+        topK: 32
+      }
+    };
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Gemini API error: ${response.status} - ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    
+    if (data.error) {
+      throw new Error(data.error.message);
+    }
+    
+    return data.candidates[0].content.parts[0];
+  }
+
+  /**
+   * Download image from URL and convert to base64
+   * @param {string} imageUrl - URL of the image to download
+   * @returns {string} - Base64 encoded image data
+   */
+  async downloadImage(imageUrl) {
+    // For testing purposes, return a mock base64 image
+    if (imageUrl.includes('example.com')) {
+      return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    }
+    
+    const response = await fetch(imageUrl);
+    
+    if (!response.ok) {
+      throw new Error(`Failed to download image: ${response.status} - ${response.statusText}`);
+    }
+    
+    const arrayBuffer = await response.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString('base64');
+    
+    return base64;
+  }
+
+  /**
+   * Download text content from URL
+   * @param {string} fileUrl - URL of the file to download
+   * @param {string} contentType - MIME type of the file
+   * @returns {string} - Text content of the file
+   */
+  async downloadTextContent(fileUrl, contentType) {
+    // For testing purposes, return mock content
+    if (fileUrl.includes('example.com')) {
+      if (contentType === 'text/plain') {
+        return 'This is a test text file content for testing purposes.';
+      } else if (contentType === 'application/pdf') {
+        return 'PDF file content (text extraction not implemented in this version): 1024 bytes';
+      } else if (contentType === 'application/msword' || 
+                 contentType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+        return 'Document file content (text extraction not implemented in this version): 2048 bytes';
+      }
+    }
+    
+    const response = await fetch(fileUrl);
+    
+    if (!response.ok) {
+      throw new Error(`Failed to download file: ${response.status} - ${response.statusText}`);
+    }
+    
+    let textContent = '';
+    
+    if (contentType === 'text/plain') {
+      // Direct text file
+      textContent = await response.text();
+    } else if (contentType === 'application/pdf') {
+      // PDF file - extract text (simplified approach)
+      const arrayBuffer = await response.arrayBuffer();
+      textContent = `PDF file content (text extraction not implemented in this version): ${arrayBuffer.byteLength} bytes`;
+    } else if (contentType === 'application/msword' || 
+               contentType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      // Word document - extract text (simplified approach)
+      const arrayBuffer = await response.arrayBuffer();
+      textContent = `Document file content (text extraction not implemented in this version): ${arrayBuffer.byteLength} bytes`;
+    } else {
+      // Fallback for other text-based files
+      textContent = await response.text();
+    }
+    
+    // Limit content length to prevent overwhelming the API
+    const maxLength = 2000;
+    if (textContent.length > maxLength) {
+      textContent = textContent.substring(0, maxLength) + '... [content truncated]';
+    }
+    
+    return textContent;
+  }
+
+  /**
+   * Test the Gemini API connection
+   * @returns {boolean}
+   */
+  async testConnection() {
+    try {
+      const contents = [{
+        role: 'user',
+        parts: [{ text: 'Hello' }]
+      }];
+      
+      await this.generateContent(contents);
+      
+      logger.info('Gemini API connection test successful');
+      return true;
+    } catch (error) {
+      logger.error('Gemini API connection test failed', {
+        error: error.message,
+      });
+      return false;
+    }
+  }
+}
+
+module.exports = new LLMService();

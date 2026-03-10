@@ -1,0 +1,19 @@
+{
+  "name": "discord-ai-bot",
+  "version": "1.0.0",
+  "description": "A Discord AI chatbot with LLM integration, conversation memory, and rate limiting",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["discord", "bot", "ai", "chatgpt", "llm"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.8.0",
+    "dotenv": "^16.4.5",
+    "rate-limiter-flexible": "^5.0.3",
+    "winston": "^3.17.0"
+  }
+}
